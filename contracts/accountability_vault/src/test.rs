@@ -974,7 +974,7 @@ fn one_milestone(env: &Env, amount: i128, due_date: u64) -> Vec<Milestone> {
 #[test]
 fn test_create_vault_rejects_creator_as_verifier() {
     let f = create_fixture();
-    let verifier_set = verifier_set_of(&f.env, &[f.creator.clone()], 1);
+    let verifier_set = verifier_set_of(&f.env, core::slice::from_ref(&f.creator), 1);
 
     let result = f.contract.try_create_vault(
         &String::from_str(&f.env, "v-creator-verifier"),
