@@ -31,8 +31,14 @@ struct FuzzInput {
     milestones: Vec<FuzzMilestone>,
     /// Threshold for the verifier set (0 hits InvalidThreshold, >1 tests M-of-N path).
     threshold: u32,
-    /// Number of verifiers (0 hits NoVerifiers).
+    /// Number of verifiers (0 hits NoVerifiers, >MAX_VERIFIERS hits TooManyVerifiers).
     num_verifiers: u8,
+    /// Append the creator to the verifier set (hits CreatorIsVerifier).
+    creator_as_verifier: bool,
+    /// Repeat an existing verifier address (hits DuplicateVerifier).
+    duplicate_verifier: bool,
+    /// Use the creator as the oracle (hits CreatorIsVerifier).
+    creator_as_oracle: bool,
 }
 
 #[derive(Debug, arbitrary::Arbitrary)]
@@ -69,17 +75,31 @@ fuzz_target!(|input: FuzzInput| {
     // Build addresses.
     let success = Address::generate(&env);
     let failure = Address::generate(&env);
-    let guardian = Address::generate(&env);
 
-    let num_verifiers = (input.num_verifiers as usize).min(8); // cap to keep runtime bounded
+    // Cap just above MAX_VERIFIERS so the TooManyVerifiers branch is reachable
+    // while keeping the O(n^2) duplicate scan bounded.
+    let num_verifiers = (input.num_verifiers as usize).min(12);
     let mut verifiers = vec![&env];
     for _ in 0..num_verifiers {
         verifiers.push_back(Address::generate(&env));
+    }
+    if input.creator_as_verifier {
+        verifiers.push_back(creator.clone());
+    }
+    if input.duplicate_verifier && !verifiers.is_empty() {
+        let first = verifiers.get(0).unwrap();
+        verifiers.push_back(first);
     }
 
     let verifier_set = VerifierSet {
         verifiers,
         threshold: input.threshold,
+    };
+
+    let oracle = if input.creator_as_oracle {
+        Some(creator.clone())
+    } else {
+        None
     };
 
     // Compute end_timestamp, saturating at 0 to avoid u64 wraps.
@@ -107,13 +127,12 @@ fuzz_target!(|input: FuzzInput| {
         &vault_id,
         &creator,
         &verifier_set,
-        &None,
+        &oracle,
         &token_addr,
         &input.amount,
         &success,
         &failure,
         &end_timestamp,
         &milestones,
-        &guardian,
     );
 });

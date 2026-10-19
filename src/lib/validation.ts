@@ -1,4 +1,5 @@
 import { z, ZodError } from 'zod'
+import { StrKey } from '@stellar/stellar-sdk'
 import { UserRole } from '../types/user.js'
 import { hasTimezoneDesignator, isValidISO8601, parseAndNormalizeToUTC } from '../utils/timestamps.js'
 
@@ -11,16 +12,22 @@ export const registerSchema = z.object({
 
 export const loginSchema = z.object({
     email: z.string().email(),
-    password: z.string().min(8),
-})
+    password: z.string().min(8),})
 
 export const refreshSchema = z.object({
-    refreshToken: z.string(),
+  refreshToken: z.string(),
 })
 
 export type RegisterInput = z.infer<typeof registerSchema>
 export type LoginInput = z.infer<typeof loginSchema>
 export type RefreshInput = z.infer<typeof refreshSchema>
+
+const stellarPublicKeySchema = z
+  .string()
+  .refine(
+    (value) => StrKey.isValidEd25519PublicKey(value) || StrKey.isValidMed25519PublicKey(value),
+    'must be a valid Stellar public key',
+  )
 
 export const utcTimestampSchema = z
   .string({ error: 'required' })
@@ -56,7 +63,43 @@ export const utcTimestampSchema = z
     }
   })
 
+/**
+ * Allow-list for `PATCH /api/vaults/:id`.
+ *
+ * Vault ownership fields (`creator`), lifecycle (`status`) and economics
+ * (`amount`) are deliberately absent from the editable shape: a PATCH must
+ * never be able to redirect settlement destinations, mark a vault complete or
+ * change the staked amount. `creator`, `status`, `amount` and `startDate` are
+ * declared with `z.never()` so clients receive a field-level error rather than
+ * a generic "unrecognized key" message; any other unknown field is rejected by
+ * `.strict()`.
+ *
+ * State-dependent rules (draft-only verifier/destination edits, endDate may
+ * only move later, terminal vaults are immutable) are enforced in the route,
+ * because they depend on the stored vault.
+ */
+export const vaultPatchSchema = z
+  .object({
+    /** Extension of the vault deadline. Must be later than the stored value. */
+    endDate: utcTimestampSchema.optional(),
+    /** Only editable while the vault is still a draft. */
+    verifier: stellarPublicKeySchema.optional(),
+    /** Only editable while the vault is still a draft. */
+    successDestination: stellarPublicKeySchema.optional(),
+    /** Only editable while the vault is still a draft. */
+    failureDestination: stellarPublicKeySchema.optional(),
+    creator: z.never({ error: 'creator cannot be changed' }).optional(),
+    status: z.never({ error: 'status cannot be changed' }).optional(),
+    amount: z.never({ error: 'amount cannot be changed' }).optional(),
+    startDate: z.never({ error: 'startDate cannot be changed' }).optional(),
+  })
+  .strict()
+  .refine((data) => Object.keys(data).length > 0, {
+    message: 'at least one editable field is required',
+    path: [],
+  })
 
+export type VaultPatchInput = z.infer<typeof vaultPatchSchema>
 
 export const nonEmptyString = z.string().trim().min(1)
 

@@ -19,6 +19,7 @@ import { buildVaultCreationPayload } from '../services/soroban.js'
 import { createVaultWithMilestones, getVaultById, listVaults, cancelVaultById, updateVaultById, getVaultRevisionById, getVaultETag } from '../services/vaultStore.js'
 import { createVaultIdempotently, VaultCreationIdempotencyConflictError, VaultCreationInProgressError, VaultCreationOwnerError } from '../services/vaultCreationIdempotency.js'
 import { createVaultSchema, flattenZodErrors, isValidStellarAddress, isMemoRequired, assertValidVaultCreateResponse } from '../services/vaultValidation.js'
+import { vaultPatchSchema } from '../lib/validation.js'
 import { StrKey } from '@stellar/stellar-sdk'
 import { AppError } from '../middleware/errorHandler.js'
 import { queryParser } from '../middleware/queryParser.js'
@@ -305,16 +306,112 @@ vaultsRouter.get('/:id', authenticate, requireScopes(ApiScope.ReadVaults), requi
   }
 })
 
-// PATCH /api/vaults/:id — optimistic-lock update; requires X-Vault-Revision header
-vaultsRouter.patch('/:id', authenticate, requireValidVaultId, async (req: Request, res: Response) => {
+// ─── PATCH /api/vaults/:id ──────────────────────────────────────────────────
+//
+// Optimistic-lock update; requires X-Vault-Revision. The body is restricted to
+// an explicit allow-list (`vaultPatchSchema`) and ownership is checked against
+// the verified principal before anything is written. Unauthorised callers get
+// 404, not 403, so vault ids cannot be enumerated.
+
+const TERMINAL_VAULT_STATUSES: ReadonlySet<string> = new Set(['completed', 'failed', 'cancelled'])
+
+/** Fields that may only change while the vault is still a draft. */
+const DRAFT_ONLY_PATCH_FIELDS = ['verifier', 'successDestination', 'failureDestination'] as const
+
+// API-key callers need the write scope; JWT callers are governed by the
+// ownership check below (requireScopes only acts when req.apiKeyAuth is set).
+vaultsRouter.patch('/:id', authenticate, requireScopes(ApiScope.WriteVaults), requireValidVaultId, async (req: Request, res: Response) => {
   const revision = req.header('x-vault-revision') ?? ''
   if (!revision) {
     res.status(400).json({ error: 'X-Vault-Revision header is required' })
     return
   }
 
+  const actorUserId = resolveActorUserId(req)
+  if (!actorUserId) {
+    res.status(401).json({
+      error: { code: 'UNAUTHORIZED', message: 'Authentication required to update a vault' },
+    })
+    return
+  }
+
   try {
-    const updated = await updateVaultById(req.params.id, revision, req.body)
+    const vault = await getVaultById(req.params.id)
+    const isAdmin = req.user?.role === UserRole.ADMIN
+
+    // 404 for both "missing" and "not yours": revealing the difference would
+    // let an attacker enumerate valid vault ids across tenants.
+    if (!vault || (vault.creator !== actorUserId && !isAdmin)) {
+      res.status(404).json({ error: 'Vault not found' })
+      return
+    }
+
+    const parsed = vaultPatchSchema.safeParse(req.body ?? {})
+    if (!parsed.success) {
+      res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid request payload',
+          fields: flattenZodErrors(parsed.error),
+        },
+      })
+      return
+    }
+    const patch = parsed.data
+
+    // Terminal vaults are immutable, and a disputed vault is awaiting a
+    // guardian decision that an edit could influence.
+    if (TERMINAL_VAULT_STATUSES.has(vault.status)) {
+      res.status(409).json({ error: `Vault is '${vault.status}' and can no longer be edited` })
+      return
+    }
+    if (vault.status === 'disputed') {
+      res.status(409).json({ error: "Vault is 'disputed' and cannot be edited until the dispute is resolved" })
+      return
+    }
+
+    if (vault.status !== 'draft') {
+      const attempted = DRAFT_ONLY_PATCH_FIELDS.filter((field) => patch[field] !== undefined)
+      if (attempted.length > 0) {
+        res.status(409).json({
+          error: `${attempted.join(', ')} can only be changed while the vault is a draft`,
+        })
+        return
+      }
+    }
+
+    // The deadline may only move later. A shrink could strand milestones or
+    // front-run a slash; extension is the only legitimate post-creation edit.
+    if (patch.endDate !== undefined) {
+      const currentEnd = Date.parse(vault.endDate)
+      const nextEnd = Date.parse(patch.endDate)
+      if (!Number.isFinite(currentEnd) || !Number.isFinite(nextEnd) || nextEnd <= currentEnd) {
+        res.status(400).json({ error: 'endDate can only be extended to a later date' })
+        return
+      }
+    }
+
+    const updated = await updateVaultById(req.params.id, revision, patch)
+
+    // Record what changed (old -> new) so a compromised or mistaken edit can be
+    // reconstructed later. The audit log is best-effort: it must not turn a
+    // successful update into a 500 if the audit store is unavailable.
+    const changes = Object.fromEntries(
+      Object.entries(patch).map(([field, to]) => [
+        field,
+        { from: (vault as unknown as Record<string, unknown>)[field] ?? null, to },
+      ]),
+    )
+    await createAuditLog({
+      actor_user_id: actorUserId,
+      action: 'vault.updated',
+      target_type: 'vault',
+      target_id: req.params.id,
+      metadata: { fields: Object.keys(patch), changes },
+    }).catch((error) => {
+      console.error('Failed to write vault.updated audit log', error)
+    })
+
     res.json(updated)
   } catch (err: any) {
     if (err?.status === 409) {

@@ -5,8 +5,28 @@
 import { randomUUID, randomBytes } from 'node:crypto'
 
 const DAY = 86400000
+const HOUR = 3600000
 const iso = (d) => new Date(d).toISOString()
 const hex = (n) => randomBytes(n).toString('hex')
+
+/**
+ * Shapes one verifier-queue row. Flags are computed against `now` (server time)
+ * so the API and any client clock cannot disagree about what is overdue.
+ */
+const queueItem = ({ vaultId, vaultName, creator, milestone, dueMs, now }) => ({
+  vaultId,
+  vaultName: vaultName || `Vault ${vaultId}`,
+  creator: creator || null,
+  milestone: {
+    id: milestone.id,
+    title: milestone.title,
+    amount: String(Number(milestone.amount)),
+    dueDate: dueMs === null ? null : iso(dueMs),
+  },
+  overdue: dueMs !== null && dueMs < now,
+  // Nearest whole hour; negative values mean the milestone is already late.
+  dueInHours: dueMs === null ? null : Math.round((dueMs - now) / HOUR),
+})
 
 function seed() {
   const now = Date.now()
@@ -35,13 +55,50 @@ function seed() {
   return { vaults, activity }
 }
 
-class MemoryStore {
+export class MemoryStore {
   kind = 'memory'
   constructor() { const s = seed(); this.vaults = s.vaults; this.activity = s.activity }
   async init() {}
   async listVaults({ creator, status } = {}) {
     return this.vaults.filter((v) => (!creator || v.creator === creator) && (!status || v.status === status))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+  }
+  /**
+   * Pending milestones of active vaults assigned to `verifier`.
+   *
+   * Equivalent to the Postgres query in `PgStore.listVerifierQueue`: overdue
+   * milestones are always included, `dueWithinDays` bounds the future window,
+   * milestones with neither `dueDate` nor a vault deadline sort last.
+   */
+  async listVerifierQueue(verifier, { dueWithinDays = 7, limit = 50 } = {}) {
+    const now = Date.now()
+    const cutoff = now + dueWithinDays * DAY
+    const items = []
+
+    for (const vault of this.vaults) {
+      if (vault.status !== 'active' || vault.verifier !== verifier) continue
+      for (const milestone of vault.milestones || []) {
+        if (milestone.status !== 'pending') continue
+        const dueDate = milestone.dueDate || vault.endDate || null
+        const dueMs = dueDate ? new Date(dueDate).getTime() : null
+        if (dueMs !== null && dueMs > cutoff) continue
+        items.push({ dueMs, item: queueItem({
+          vaultId: vault.id,
+          vaultName: vault.name,
+          creator: vault.creator,
+          milestone,
+          dueMs,
+          now,
+        }) })
+      }
+    }
+
+    // Sort by the same value the flags use (due date, else the vault deadline,
+    // else last) so the ordering matches `ORDER BY COALESCE(due_date, deadline)
+    // ASC NULLS LAST` in the Postgres store.
+    items.sort((a, b) => (a.dueMs ?? Infinity) - (b.dueMs ?? Infinity))
+
+    return items.slice(0, limit).map((entry) => entry.item)
   }
   async getVault(id) { return this.vaults.find((v) => v.id === id) || null }
   async createVault(v) { this.vaults.push(v); return v }
@@ -52,7 +109,7 @@ class MemoryStore {
   }
 }
 
-class PgStore {
+export class PgStore {
   kind = 'postgres'
   constructor(pool) { this.pool = pool }
   async init() {
@@ -89,6 +146,47 @@ class PgStore {
     if (!rows.length) return []
     const ms = (await this.pool.query('SELECT * FROM milestones WHERE vault_id = ANY($1) AND deleted_at IS NULL', [rows.map((r) => r.id)])).rows
     return rows.map((r) => this.rowToVault(r, ms))
+  }
+  /**
+   * Pending milestones of active vaults assigned to `verifier`, ordered by due
+   * date. One indexed query, no N+1: callers get exactly the rows they render.
+   *
+   * `dueWithinDays` bounds the future window, but milestones already overdue
+   * are always returned (`due_at <= now + window`). Rows with neither a due
+   * date nor a deadline are returned last so nothing silently disappears.
+   */
+  async listVerifierQueue(verifier, { dueWithinDays = 7, limit = 50 } = {}) {
+    const now = Date.now()
+    const horizon = iso(now + dueWithinDays * DAY)
+    const { rows } = await this.pool.query(
+      `SELECT v.id AS vault_id, v.name AS vault_name, v.creator,
+              m.id AS milestone_id, m.title AS milestone_title, m.amount AS milestone_amount,
+              COALESCE(m.due_date, m.deadline) AS due_at
+         FROM vaults v
+         JOIN milestones m ON m.vault_id = v.id
+        WHERE v.verifier = $1
+          AND v.status = 'active'::vault_status
+          AND v.deleted_at IS NULL
+          AND m.status = 'pending'::milestone_status
+          AND m.deleted_at IS NULL
+          AND (COALESCE(m.due_date, m.deadline) IS NULL
+               OR COALESCE(m.due_date, m.deadline) <= $2::timestamptz)
+        ORDER BY COALESCE(m.due_date, m.deadline) ASC NULLS LAST
+        LIMIT $3`,
+      [verifier, horizon, limit],
+    )
+
+    return rows.map((r) => {
+      const dueMs = r.due_at === null || r.due_at === undefined ? null : new Date(r.due_at).getTime()
+      return queueItem({
+        vaultId: r.vault_id,
+        vaultName: r.vault_name,
+        creator: r.creator,
+        milestone: { id: r.milestone_id, title: r.milestone_title, amount: r.milestone_amount },
+        dueMs,
+        now,
+      })
+    })
   }
   async getVault(id) {
     const { rows } = await this.pool.query('SELECT * FROM vaults WHERE id = $1 AND deleted_at IS NULL', [id])

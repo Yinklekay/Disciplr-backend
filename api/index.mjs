@@ -13,6 +13,19 @@ app.use(express.json({ limit: '100kb' }))
 const STELLAR = /^G[A-Z2-7]{55}$/
 const hex = (n) => randomBytes(n).toString('hex')
 const bad = (res, msg, code = 400) => res.status(code).json({ error: msg })
+
+/** Parses an optional integer query param, rejecting non-numeric and out-of-range input. */
+const boundedInt = (raw, { min, max, fallback }) => {
+  if (raw === undefined) return { value: fallback }
+  if (typeof raw !== 'string' || !/^-?\d+$/.test(raw)) {
+    return { error: `must be an integer between ${min} and ${max}` }
+  }
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < min || value > max) {
+    return { error: `must be an integer between ${min} and ${max}` }
+  }
+  return { value }
+}
 const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(e); res.status(500).json({ error: 'Internal error' }) })
 
 const router = express.Router()
@@ -27,6 +40,29 @@ router.get('/vaults', wrap(async (req, res) => {
   const s = await getStore()
   const vaults = await s.listVaults({ creator: req.query.creator, status: req.query.status })
   res.json({ data: vaults, count: vaults.length })
+}))
+
+// A verifier's to-do list: pending milestones of active vaults they are
+// responsible for, soonest first, with overdue / due-soon flags computed
+// against server time. Without this, a client has to fetch every vault (capped
+// at 200) and filter locally, which is both wasteful and wrong past the cap.
+router.get('/verifiers/:address/queue', wrap(async (req, res) => {
+  const { address } = req.params
+  const dueWithinDays = boundedInt(req.query.dueWithinDays, { min: 0, max: 365, fallback: 7 })
+  const limit = boundedInt(req.query.limit, { min: 1, max: 100, fallback: 50 })
+
+  const details = []
+  if (!STELLAR.test(address)) details.push('address must be a Stellar public key (G..., 56 chars)')
+  if (dueWithinDays.error) details.push(`dueWithinDays ${dueWithinDays.error}`)
+  if (limit.error) details.push(`limit ${limit.error}`)
+  if (details.length) return res.status(400).json({ error: 'Validation failed', details })
+
+  const s = await getStore()
+  const data = await s.listVerifierQueue(address, {
+    dueWithinDays: dueWithinDays.value,
+    limit: limit.value,
+  })
+  res.json({ data, count: data.length })
 }))
 
 router.get('/vaults/:id', wrap(async (req, res) => {

@@ -2,9 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, integration/staging]
   pull_request:
-    branches: [main]
+    # Integration branch is the PR target for feature work (see CONTRIBUTING);
+    # without it here, those PRs get no CI at all.
+    branches: [main, integration/staging]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -26,3 +28,34 @@ jobs:
       - run: npm test
         env:
           NODE_ENV: test
+
+  # The Rust contract is part of this repository and is not covered by the
+  # Node job above. Kept as a separate job so a contract-only change does not
+  # re-run the (much slower) Jest suite, and vice versa.
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+      - run: cargo fmt --all -- --check
+      # Advisory for now. `cargo clippy -p accountability_vault -- -D warnings`
+      # is already red on the current tree for pre-existing reasons (47 findings:
+      # missing docs on public items, too_many_arguments on create_vault, and a
+      # `rust_2024_compatibility` lint-group priority clash in Cargo.toml). Making
+      # it blocking would fail every PR until that backlog is cleared, which is
+      # tracked separately. `deprecated` is allowed explicitly because
+      # soroban-sdk 23 deprecates `Events::publish` in favour of
+      # `#[contractevent]`; migrating every event is a separate, behaviour-neutral
+      # refactor. Flip continue-on-error off once the backlog is fixed.
+      - run: cargo clippy -p accountability_vault --all-targets -- -D warnings -A deprecated
+        continue-on-error: true
+      - run: cargo test -p accountability_vault
