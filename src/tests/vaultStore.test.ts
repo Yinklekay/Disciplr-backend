@@ -94,6 +94,35 @@ it("returns conflict when vault does not exist", async () => {
   );
 });
 
+it("ignores stray keys instead of writing undefined columns", async () => {
+  const { vault } = await createVaultWithMilestones(buildVaultInput());
+  const revision = await getVaultRevisionById(vault.id);
+  assert.notEqual(revision, null);
+
+  const nextVerifier = stellar();
+  const updated = await updateVaultById(vault.id, revision!, {
+    verifier: nextVerifier,
+    // Runtime-only junk that a caller could smuggle past the TypeScript type.
+    bogus: "value",
+    ["__proto__"]: { polluted: true },
+  } as any);
+
+  assert.equal(updated.verifier, nextVerifier);
+  assert.equal((updated as Record<string, unknown>).bogus, undefined);
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
+});
+
+it("rejects a payload made up only of stray keys", async () => {
+  const { vault } = await createVaultWithMilestones(buildVaultInput());
+  const revision = await getVaultRevisionById(vault.id);
+  assert.notEqual(revision, null);
+
+  await assert.rejects(
+    () => updateVaultById(vault.id, revision!, { bogus: "value" } as any),
+    (error) => (error as { status?: number }).status === 400,
+  );
+});
+
 it("rejects empty update payload", async () => {
   const { vault } = await createVaultWithMilestones(buildVaultInput());
   const revision = await getVaultRevisionById(vault.id);

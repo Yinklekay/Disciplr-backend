@@ -11,6 +11,13 @@ import { getOrSet, getOrLoad, invalidate, invalidatePrefix } from "../lib/cache.
 import { encodeCursor, decodeCursor } from "../utils/pagination.js";
 import { normalizeTimestamp, toUTCDate } from "../utils/timestamps.js";
 
+/**
+ * Columns this internal helper can write. This is deliberately broader than
+ * the public `PATCH /api/vaults/:id` contract: the route forwards only
+ * `endDate`, `verifier`, `successDestination` and `failureDestination`, while
+ * lifecycle/ownership fields remain available to internal callers (and the
+ * store's own tests). Never widen the route to accept these directly.
+ */
 type UpdateableVaultField =
   | "amount"
   | "startDate"
@@ -502,11 +509,24 @@ export const updateVaultById = async (
     throw new BadRequestError("revision is required");
   }
 
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new BadRequestError("payload must be an object");
+  }
+
+  // Defence in depth: the PATCH route only forwards allow-listed fields, but
+  // this helper is also reachable from internal callers and tests. Ignore any
+  // key that is not in the column map so a stray key (including prototype keys
+  // such as `__proto__`) can never produce `undefined = $n` SQL or be spread
+  // onto a memory-store vault.
   const entries = (
     Object.entries(payload) as Array<
       [UpdateableVaultField, PersistedVault[UpdateableVaultField]]
     >
-  ).filter(([, value]) => value !== undefined);
+  ).filter(
+    ([field, value]) =>
+      value !== undefined &&
+      Object.prototype.hasOwnProperty.call(vaultFieldToColumn, field),
+  );
 
   if (entries.length === 0) {
     throw new BadRequestError("no vault fields provided for update");
