@@ -367,6 +367,56 @@ paths:
           content:
             application/json:
               schema: {}
+  /api/vaults/{vaultId}:
+    patch:
+      summary: Update a vault (allow-listed fields only)
+      tags:
+        - Vaults
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: vaultId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Vault-Revision
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Optimistic-lock revision (the ETag returned by GET
+            /api/vaults/{vaultId})
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                endDate:
+                  type: string
+                  format: date-time
+                verifier:
+                  type: string
+                successDestination:
+                  type: string
+                failureDestination:
+                  type: string
+      responses:
+        "200":
+          description: Vault updated
+          content:
+            application/json:
+              schema: {}
+        "400":
+          description: "Validation failed: immutable field (creator, status, amount,
+            startDate), unknown field, invalid Stellar address, or endDate not
+            later than the current value"
+        "404":
+          description: Vault not found, or not owned by the caller (never 403)
+        "409":
+          description: Revision conflict, terminal or disputed vault, or a draft-only
+            field changed outside the draft state
   /api/vaults/{vaultId}/milestones:
     get:
       summary: Get milestones for a vault

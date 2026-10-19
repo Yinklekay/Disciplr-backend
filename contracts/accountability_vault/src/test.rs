@@ -270,10 +270,10 @@ fn claim_all_milestones_sequentially(offsets: &[u64], amounts: &[i128]) -> Vault
     let total: i128 = amounts.iter().sum();
 
     let mut released_so_far: i128 = 0;
-    for i in 0..amounts.len() {
+    for (i, amount) in amounts.iter().enumerate() {
         s.contract
             .claim_milestone(&s.vault_id, &s.creator, &(i as u32));
-        released_so_far += amounts[i];
+        released_so_far += amount;
 
         let vault = s.contract.get_vault(&s.vault_id);
         // Solvency: staked must equal what remains.

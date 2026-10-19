@@ -209,6 +209,71 @@ registry.registerPath({
   },
 })
 
+// PATCH /api/vaults/:id
+// Ownership-checked, allow-listed update (see `vaultPatchSchema`). Callers who
+// do not own the vault receive 404 rather than 403 so vault ids cannot be
+// enumerated across tenants.
+registry.registerPath({
+  method: 'patch',
+  path: '/api/vaults/{vaultId}',
+  summary: 'Update a vault (allow-listed fields only)',
+  tags: ['Vaults'],
+  security: [{ bearerAuth: [] }],
+  parameters: [
+    {
+      name: 'vaultId',
+      in: 'path',
+      required: true,
+      schema: { type: 'string' },
+    },
+    {
+      name: 'X-Vault-Revision',
+      in: 'header',
+      required: true,
+      schema: { type: 'string' },
+      description:
+        'Optimistic-lock revision (the ETag returned by GET /api/vaults/{vaultId})',
+    },
+  ],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            /** Extension of the vault deadline; must be later than the current value. */
+            endDate: z.string().datetime().optional(),
+            /** Draft vaults only. */
+            verifier: z.string().optional(),
+            /** Draft vaults only. */
+            successDestination: z.string().optional(),
+            /** Draft vaults only. */
+            failureDestination: z.string().optional(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Vault updated',
+      content: {
+        'application/json': { schema: z.any() },
+      },
+    },
+    400: {
+      description:
+        'Validation failed: immutable field (creator, status, amount, startDate), unknown field, invalid Stellar address, or endDate not later than the current value',
+    },
+    404: {
+      description: 'Vault not found, or not owned by the caller (never 403)',
+    },
+    409: {
+      description:
+        'Revision conflict, terminal or disputed vault, or a draft-only field changed outside the draft state',
+    },
+  },
+})
+
 // Milestones
 registry.registerPath({
   method: 'get',

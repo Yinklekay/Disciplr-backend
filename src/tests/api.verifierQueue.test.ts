@@ -184,6 +184,28 @@ describe('GET /api/verifiers/:address/queue', () => {
     expect(res.body.data[0].dueInHours).toBe(96)
   })
 
+  test('sorts by the fallback deadline, matching the Postgres COALESCE order', async () => {
+    store.vaults = [
+      vault('vault-explicit', { milestones: [milestone('m-explicit-3d', 3 * DAY)] }),
+      vault('vault-fallback-sooner', {
+        endDate: iso(NOW + 1 * DAY),
+        milestones: [milestone('m-fallback-1d', 0, { dueDate: null })],
+      }),
+    ]
+
+    const res = await request(app).get(`/api/verifiers/${VERIFIER_A}/queue`)
+
+    expect(res.status).toBe(200)
+    // The fallback-dated milestone is due sooner, so it must sort first even
+    // though its own `dueDate` is null — exactly as `ORDER BY COALESCE(...)
+    // ASC NULLS LAST` does in the Postgres store.
+    expect(res.body.data.map((row: any) => row.milestone.id)).toEqual([
+      'm-fallback-1d',
+      'm-explicit-3d',
+    ])
+    expect(res.body.data[0].milestone.dueDate).toBe(iso(NOW + 1 * DAY))
+  })
+
   describe('parameter validation', () => {
     test.each([
       ['/api/verifiers/not-an-address/queue', 'address'],

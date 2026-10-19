@@ -82,24 +82,23 @@ export class MemoryStore {
         const dueDate = milestone.dueDate || vault.endDate || null
         const dueMs = dueDate ? new Date(dueDate).getTime() : null
         if (dueMs !== null && dueMs > cutoff) continue
-        items.push(queueItem({
+        items.push({ dueMs, item: queueItem({
           vaultId: vault.id,
           vaultName: vault.name,
           creator: vault.creator,
           milestone,
           dueMs,
           now,
-        }))
+        }) })
       }
     }
 
-    items.sort((a, b) => {
-      const at = a.milestone.dueDate ? Date.parse(a.milestone.dueDate) : Infinity
-      const bt = b.milestone.dueDate ? Date.parse(b.milestone.dueDate) : Infinity
-      return at - bt
-    })
+    // Sort by the same value the flags use (due date, else the vault deadline,
+    // else last) so the ordering matches `ORDER BY COALESCE(due_date, deadline)
+    // ASC NULLS LAST` in the Postgres store.
+    items.sort((a, b) => (a.dueMs ?? Infinity) - (b.dueMs ?? Infinity))
 
-    return items.slice(0, limit)
+    return items.slice(0, limit).map((entry) => entry.item)
   }
   async getVault(id) { return this.vaults.find((v) => v.id === id) || null }
   async createVault(v) { this.vaults.push(v); return v }
