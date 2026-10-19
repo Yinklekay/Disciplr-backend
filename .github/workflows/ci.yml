@@ -2,9 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, integration/staging]
   pull_request:
-    branches: [main]
+    # Integration branch is the PR target for feature work (see CONTRIBUTING);
+    # without it here, those PRs get no CI at all.
+    branches: [main, integration/staging]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -26,3 +28,28 @@ jobs:
       - run: npm test
         env:
           NODE_ENV: test
+
+  # The Rust contract is part of this repository and is not covered by the
+  # Node job above. Kept as a separate job so a contract-only change does not
+  # re-run the (much slower) Jest suite, and vice versa.
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p accountability_vault --all-targets -- -D warnings -A deprecated
+        # `deprecated` is allowed explicitly: soroban-sdk 23 deprecates
+        # `Events::publish` in favour of `#[contractevent]`. Migrating every
+        # event is a separate, behaviour-neutral refactor; until then the
+        # deprecation is not an error and must not mask real findings.
+      - run: cargo test -p accountability_vault
