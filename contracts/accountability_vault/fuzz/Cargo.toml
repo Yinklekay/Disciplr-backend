@@ -16,8 +16,10 @@ path = ".."
 features = ["testutils"]
 
 # soroban testutils requires std; enable them so the fuzz binary can use Env.
+# Keep this in lockstep with the workspace `soroban-sdk` pin; a mismatch pulls
+# in two SDK versions and the `Env`/`Address` types no longer unify.
 [dependencies.soroban-sdk]
-version = "21.0.0"
+version = "=23.0.1"
 features = ["testutils"]
 
 [[bin]]

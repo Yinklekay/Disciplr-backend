@@ -33,6 +33,41 @@ Implements the vault lifecycle that the backend models off-chain in
 | `get_vault` | Read-only accessor for the current vault record. |
 | `get_unverified_milestone_indices` | Returns `Vec<u32>` of indices for milestones that have not yet been verified, in ascending order. Used by the keeper job (`src/jobs/handlers.ts`) to determine slash targets without loading and filtering the full vault client-side. |
 
+### Verifier-set and milestone validation
+
+`create_vault` guarantees that every vault has an independent verifier set
+that can actually reach its approval threshold. Validation runs in a fixed
+order so clients get a stable error code when input breaks several rules:
+
+1. `AlreadyInitialized`, `NoVerifiers`
+2. `TooManyVerifiers` (33): more than `MAX_VERIFIERS` (10) entries
+3. `DuplicateVerifier` (32): the same address appears twice. Duplicates are
+   counted by `verifiers.len()` but `check_in` accepts one approval per
+   address, so a duplicated set can make the threshold unreachable.
+4. `CreatorIsVerifier` (31): the creator is in the verifier set, or was passed
+   as `oracle`. A creator cannot approve their own milestones.
+5. `InvalidThreshold`, `InvalidAmount`, `InvalidDeadline` (vault deadline),
+   `NoMilestones`
+6. `InvalidFailureDestination` (26): the failure destination is the creator or
+   is identical to the success destination.
+7. Per milestone: `TitleTooLong`, `InvalidAmount`, and `InvalidDeadline` when
+   `due_date` is not in the future or is after the vault deadline.
+8. `AmountMismatch`
+
+Existing error discriminants are unchanged; the new variants use 31-33.
+
+### Dispute resolution settles funds
+
+`admin_resolve` to `Completed` or `Failed` is a terminal decision that also
+moves the remaining `staked` balance (already net of any `claim_milestone`
+releases) to the success or failure destination and zeroes `staked`. This is
+required because `claim` and `slash_on_miss` only accept `Active` vaults, so a
+vault resolved directly to a terminal state would otherwise strand its funds.
+State is persisted before the token transfer (checks-effects-interactions).
+Resolving back to `Active` moves no funds. Terminal resolution is rejected
+with `Error::Paused` while the vault is paused; a paused vault may still be
+returned to `Active`.
+
 ### Token allowlist policy
 
 `accountability_vault` enforces a deployment-wide token allowlist at vault

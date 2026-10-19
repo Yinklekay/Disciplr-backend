@@ -50,6 +50,12 @@ const MAX_DEADLINE_HORIZON: u64 = 5 * 365 * 24 * 60 * 60;
 /// Maximum allowed length in bytes for a milestone title.
 pub const MAX_TITLE_LEN: usize = 128;
 
+/// Maximum number of verifier addresses accepted by `create_vault`.
+///
+/// The duplicate-address scan is O(n^2); bounding `n` keeps that scan cheap
+/// and prevents a hostile creator from inflating the cost of vault creation.
+pub const MAX_VERIFIERS: u32 = 10;
+
 /// Storage keys for the contract.
 #[contracttype]
 #[derive(Clone)]
@@ -217,6 +223,15 @@ pub enum Error {
     MilestoneAlreadyReleased = 29,
     /// Milestone title exceeds the maximum allowed length (128 bytes).
     TitleTooLong = 30,
+    /// The creator appears in the verifier set, or was supplied as the oracle.
+    /// A creator must not be able to approve their own milestones.
+    CreatorIsVerifier = 31,
+    /// The verifier set contains the same address more than once. Duplicates
+    /// are counted by `verifiers.len()` but rejected by `check_in`, so a
+    /// duplicated set can make the approval threshold unreachable.
+    DuplicateVerifier = 32,
+    /// The verifier set contains more than `MAX_VERIFIERS` addresses.
+    TooManyVerifiers = 33,
 }
 
 /// Accountability vault contract entry point.
@@ -235,6 +250,27 @@ impl AccountabilityVault {
     /// to mark a milestone verified (M-of-N; must be >= 1 and <= verifiers.len()).
     /// `oracle` is an optional address that may confirm milestones in addition to
     /// the verifier set. Pass `None` for human-only verification.
+    ///
+    /// Validation is intentionally ordered so clients receive a stable error
+    /// code when an input breaks several rules at once:
+    ///
+    /// 1. `AlreadyInitialized`
+    /// 2. `NoVerifiers`
+    /// 3. `TooManyVerifiers` (more than `MAX_VERIFIERS`)
+    /// 4. `DuplicateVerifier`
+    /// 5. `CreatorIsVerifier` (creator in the verifier set, then oracle == creator)
+    /// 6. `InvalidThreshold`
+    /// 7. `InvalidAmount` (vault amount)
+    /// 8. `InvalidDeadline` (vault end).
+    /// 9. `NoMilestones`
+    /// 10. `InvalidFailureDestination` (failure destination is the creator or the
+    ///     success destination)
+    /// 11. Per milestone: `TitleTooLong`, `InvalidAmount`, `InvalidDeadline`
+    ///     (due date not in the future, or due date after the vault end).
+    /// 12. `AmountMismatch`
+    ///
+    /// Every vault therefore has an independent verifier set whose threshold is
+    /// reachable, and milestones that have not already expired.
     pub fn create_vault(
         env: Env,
         vault_id: String,
@@ -257,7 +293,37 @@ impl AccountabilityVault {
         if verifier_set.verifiers.is_empty() {
             return Err(Error::NoVerifiers);
         }
-        if verifier_set.threshold == 0 || verifier_set.threshold > verifier_set.verifiers.len() {
+        if verifier_set.verifiers.len() > MAX_VERIFIERS {
+            return Err(Error::TooManyVerifiers);
+        }
+
+        // Reject duplicate addresses before counting them towards the threshold:
+        // `check_in` allows one approval per address, so a duplicated set can
+        // make `approval_threshold` unreachable and guarantee a slash.
+        let verifier_count = verifier_set.verifiers.len();
+        for i in 0..verifier_count {
+            let candidate = verifier_set.verifiers.get(i).unwrap();
+            for j in (i + 1)..verifier_count {
+                if candidate == verifier_set.verifiers.get(j).unwrap() {
+                    return Err(Error::DuplicateVerifier);
+                }
+            }
+        }
+
+        // Independent verification is the point of the product: a creator must
+        // not be able to approve their own milestones, directly or via the oracle.
+        for verifier in verifier_set.verifiers.iter() {
+            if verifier == creator {
+                return Err(Error::CreatorIsVerifier);
+            }
+        }
+        if let Some(oracle_address) = oracle.clone() {
+            if oracle_address == creator {
+                return Err(Error::CreatorIsVerifier);
+            }
+        }
+
+        if verifier_set.threshold == 0 || verifier_set.threshold > verifier_count {
             return Err(Error::InvalidThreshold);
         }
         let verifiers = verifier_set.verifiers;
@@ -274,7 +340,9 @@ impl AccountabilityVault {
         if milestones.is_empty() {
             return Err(Error::NoMilestones);
         }
-        if failure_destination == creator {
+        // A vault whose two outcomes pay the same address has no accountability
+        // meaning, and `failure_destination == creator` would refund a slash.
+        if failure_destination == creator || failure_destination == success_destination {
             return Err(Error::InvalidFailureDestination);
         }
 
@@ -285,6 +353,11 @@ impl AccountabilityVault {
             }
             if m.amount <= 0 {
                 return Err(Error::InvalidAmount);
+            }
+            // `check_in` rejects approvals after `due_date`, so an already-expired
+            // milestone could never be verified and would guarantee a slash.
+            if m.due_date <= env.ledger().timestamp() {
+                return Err(Error::InvalidDeadline);
             }
             if m.due_date > end_timestamp {
                 return Err(Error::InvalidDeadline);
@@ -866,9 +939,21 @@ impl AccountabilityVault {
     /// three statuses; any other value is rejected with `Error::NotActive`.
     ///
     /// Resolving to `Completed` or `Failed` is a terminal administrative decision
-    /// and does **not** trigger a token transfer — settlement still goes through
-    /// `claim` (for Completed) or `slash_on_miss` (for Failed) once the vault is
-    /// back in the appropriate resolved state.
+    /// and settles the vault immediately: the remaining `staked` balance (which
+    /// already excludes anything released through `claim_milestone`) is
+    /// transferred to `success_destination` or `failure_destination` respectively.
+    /// This is required because `claim` and `slash_on_miss` only accept `Active`
+    /// vaults, so a vault resolved straight to a terminal state would otherwise
+    /// strand its funds forever.
+    ///
+    /// Resolving to `Active` moves no funds; normal settlement can then resume.
+    ///
+    /// Checks-Effects-Interactions: `status` is set and `staked` is zeroed in
+    /// storage BEFORE the token transfer, so a panic in the token contract cannot
+    /// leave a terminal vault with a non-zero `staked` balance (which would block
+    /// `reclaim_after_settlement`). A paused vault can still be returned to
+    /// `Active`, but terminal resolution is rejected with `Error::Paused` until
+    /// the guardian unpauses, so settlement cannot bypass the emergency brake.
     pub fn admin_resolve(
         env: Env,
         vault_id: String,
@@ -890,15 +975,65 @@ impl AccountabilityVault {
             _ => return Err(Error::NotActive),
         }
 
+        // Returning the vault to Active is a pure state change: the creator or a
+        // verifier can then settle it through the normal claim / slash paths.
+        if target == VaultStatus::Active {
+            vault.status = VaultStatus::Active;
+            let key = DataKey::Vault(vault_id);
+            env.storage().persistent().set(&key, &vault);
+            Self::extend_ttl(&env, &key);
+
+            env.events().publish(
+                (String::from_str(&env, "vault_dispute_resolved"), admin),
+                target as u32,
+            );
+            return Ok(());
+        }
+
+        // Terminal resolution settles now. Respect the guardian's emergency brake:
+        // a paused vault must be unpaused before funds leave the contract.
+        if vault.paused {
+            return Err(Error::Paused);
+        }
+
+        // CEI: capture transfer values, update and persist state, then call the token.
+        // `staked` (not `amount`) is the source of truth so fee-on-transfer tokens
+        // and milestones already released via `claim_milestone` are handled.
+        let settled = vault.staked;
+        let token_addr = vault.token.clone();
+        let (destination, event_name) = if target == VaultStatus::Completed {
+            (
+                vault.success_destination.clone(),
+                Symbol::new(&env, "vault_completed"),
+            )
+        } else {
+            (
+                vault.failure_destination.clone(),
+                Symbol::new(&env, "vault_slashed"),
+            )
+        };
+
         vault.status = target;
+        vault.staked = 0;
         let key = DataKey::Vault(vault_id);
         env.storage().persistent().set(&key, &vault);
         Self::extend_ttl(&env, &key);
 
+        if settled > 0 {
+            token::Client::new(&env, &token_addr).transfer(
+                &env.current_contract_address(),
+                &destination,
+                &settled,
+            );
+        }
+
+        // `vault_dispute_resolved` keeps the existing resolution signal, while the
+        // terminal event carries the amount so indexers can reconcile balances.
         env.events().publish(
             (String::from_str(&env, "vault_dispute_resolved"), admin),
             target as u32,
         );
+        env.events().publish((event_name, destination), settled);
         Ok(())
     }
 
